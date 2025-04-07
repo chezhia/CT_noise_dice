@@ -1,0 +1,17 @@
+{
+    "right adrenal gland": "adrenal_gland_right.nii.gz",
+    "left adrenal gland": "adrenal_gland_left.nii.gz",
+    "bladder": "urinary_bladder.nii.gz",
+    "duodenum": "duodenum.nii.gz",
+    "esophagus": "esophagus.nii.gz",
+    "gallbladder": "gallbladder.nii.gz",
+    "heart": "heart.nii.gz",
+    "right kidney": "kidney_right.nii.gz",
+    "left kidney": "kidney_left.nii.gz",
+    "liver": "liver.nii.gz",
+    "pancreas": "pancreas.nii.gz",
+    "prostate": "prostate.nii.gz",
+    "small bowel": "small_bowel.nii.gz",
+    "spleen": "spleen.nii.gz",
+    "stomach": "stomach.nii.gz"
+}

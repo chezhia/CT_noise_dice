@@ -1,0 +1,1288 @@
+import os
+# Force PyQt to use its own plugins instead of the ones from OpenCV
+os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = '/media/nvme/Python/PediatricCTDataset/PEdCT/lib/python3.11/site-packages/PyQt5/Qt5/plugins'
+# Disable opencv's builtin Qt
+os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'
+import sys
+sys.path.append('.')  # Add current directory to Python path
+import math
+import logging
+import numpy as np
+import pandas as pd
+import pydicom
+from pydicom.errors import InvalidDicomError
+import cv2
+from scipy.ndimage import gaussian_filter1d
+from dataclasses import dataclass
+from typing import Tuple, List, Dict, Optional
+from ct_viewer import CTViewer
+from ct_viewer import view_ct_volume as imtool3d
+
+from scipy import ndimage
+from rt_utils import RTStructBuilder  # Ensure rt_utils is installed.
+import SimpleITK as sitk
+import matplotlib.pyplot as plt
+import pydicom
+import glob
+from typing import Tuple, List, Dict, Optional
+from openpyxl import Workbook
+from pydicom.errors import InvalidDicomError
+# Add to beginning of script with other imports
+VALIDATE_SUBSET = False  # Global flag for validation
+VALIDATION_INTERVAL = 50  # Validate every Nth case
+
+# Add at beginning of script with other global variables
+COMPUTE_CONFIG = {
+    'GNI': False,      # Set to False to skip GNI computation
+    'TIAN': True,      # Set to True to compute Tian noise
+    'WED': False,      # Set to False to skip WED computation
+    'VALIDATE_SUBSET': False,  # Set to True for validation
+    'VALIDATION_INTERVAL': 500  # Validate every Nth case
+}
+
+
+# def read_ct_volume(ct_dir):
+#     """
+#     Read CT volume maintaining original DICOM order throughout processing
+#     """
+#     # Get list of DICOM files
+#     dicom_files = glob.glob(os.path.join(ct_dir, '*.dcm'))
+    
+#     # First pass: collect instance numbers and locations
+#     file_info = []
+#     for file in dicom_files:
+#         ds = pydicom.dcmread(file)
+#         file_info.append({
+#             'file': file,
+#             'instance_number': int(ds.InstanceNumber),
+#             'location': float(ds.SliceLocation)
+#         })
+    
+#     # Sort files once by instance number
+#     file_info.sort(key=lambda x: x['instance_number'])
+#     sorted_files = [info['file'] for info in file_info]
+    
+#     # Read first file for metadata
+#     first_slice = pydicom.dcmread(sorted_files[0])
+#     shape = (len(sorted_files), first_slice.Rows, first_slice.Columns)
+#     slope = float(first_slice.RescaleSlope)
+#     intercept = float(first_slice.RescaleIntercept)
+#     pixel_spacing = first_slice.PixelSpacing
+    
+#     # Initialize arrays
+#     ct_data = np.zeros(shape, dtype=np.float32)
+#     tube_current = np.zeros(len(sorted_files))
+#     slice_locations = np.zeros(len(sorted_files))
+    
+#     # Read data in sorted order
+#     for idx, file in enumerate(sorted_files):
+#         ds = pydicom.dcmread(file)
+#         ct_data[idx] = ds.pixel_array
+#         tube_current[idx] = float(ds.XRayTubeCurrent)
+#         slice_locations[idx] = float(ds.SliceLocation)
+    
+#     # Convert to HU
+#     ct_data = ct_data * slope + intercept
+    
+#     return ct_data, pixel_spacing, tube_current, slice_locations
+
+# def create_body_mask(contour):
+#     mask = np.zeros_like(contour)
+#     for i in range(contour.shape[0]):
+#         for x in range(contour.shape[2]):
+#             contour_col = contour[i, :, x]
+#             contour_points = np.where(contour_col > 0)[0]
+#             if len(contour_points) > 0:
+#                 min_y = np.min(contour_points)
+#                 max_y = np.max(contour_points)
+#                 mask[i, min_y:max_y, x] = 1
+#     return mask
+
+def remove_table(ct_data, contour):
+    cleaned = ct_data.copy()
+    for i in range(ct_data.shape[0]):
+        for x in range(ct_data.shape[2]):
+            # Find the contour points in this column
+            contour_col = contour[i, :, x]
+            contour_points = np.where(contour_col > 0)[0]
+            if len(contour_points) > 0:
+                min_y = np.min(contour_points)
+                max_y = np.max(contour_points)
+                # Set everything above and below contour to -1000 HU
+                cleaned[i, :min_y, x] = -1000  # Above body
+                cleaned[i, max_y:, x] = -1000  # Below body
+            else:
+                # If no contour in this column, set all to air
+                cleaned[i, :, x] = -1000
+    return cleaned
+
+def compute_wed(ct_data, mask, pixel_width, pixel_height):
+    wed = np.zeros(ct_data.shape[0])
+    A_pixel = pixel_width/10 * pixel_height/10  # cm²
+        
+    for i in range(ct_data.shape[0]):
+        roi_mask = mask[i].astype(bool)
+        
+        # Only include pixels within the mask
+        roi_pixels = ct_data[i][roi_mask]
+        
+        # Calculate mean CT number in ROI
+        mean_CT = np.mean(roi_pixels)
+        
+        # Calculate total ROI area, A_ROI = N_pixels (num of pixels) * A_pixel (mm²)
+        A_ROI = np.sum(roi_mask) * A_pixel
+        
+        # Calculate water equivalent area using equation from AAPM Report 220
+        A_w = ((1/1000) * mean_CT * A_ROI) + A_ROI
+        
+        # Convert area to diameter
+        wed[i] = 2 * np.sqrt(A_w / np.pi)
+        
+    return wed
+def calculate_volume_gni(ct_volume):
+    # Initialize array to store noise values for each slice
+    volume_noise = []
+    
+    # Process each slice in the volume
+    for slice_idx in range(ct_volume.shape[0]):
+        ct_slice = ct_volume[slice_idx]
+        
+        # Calculate noise map for current slice
+        noise_map = np.zeros_like(ct_slice, dtype=float)
+        kernel_size = 10
+        for i in range(ct_slice.shape[0] - kernel_size):
+            for j in range(ct_slice.shape[1] - kernel_size):
+                window = ct_slice[i:i+kernel_size, j:j+kernel_size]
+                noise_map[i,j] = np.std(window)
+        
+        # Calculate gradient to exclude anatomical borders
+        sobelx = cv2.Sobel(ct_slice, cv2.CV_64F, 1, 0)
+        sobely = cv2.Sobel(ct_slice, cv2.CV_64F, 0, 1)
+        gradient_mag = np.sqrt(sobelx**2 + sobely**2)
+        
+        # Exclude high gradient areas
+        gradient_threshold = 10
+        valid_pixels = gradient_mag < gradient_threshold
+        slice_noise = noise_map[valid_pixels]
+        
+        # Store histogram mode for this slice
+        if len(slice_noise) > 0:
+            volume_noise.append(np.argmax(np.histogram(slice_noise, bins=100)[0]))
+    
+    # Return mean GNI across all slices
+    return np.mean(volume_noise)
+def plot_parameter_vs_location(slice_locations, parameter_values, 
+                             parameter_name, ax=None, color='blue'):
+    """
+    Plot any parameter against slice location
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+    ax.plot(slice_locations, parameter_values, '-o', color=color, markersize=4)
+    ax.set_xlabel('Slice Location (mm)')
+    ax.set_ylabel(parameter_name)
+    ax.grid(True)
+    
+    return ax
+
+def create_analysis_plots(slice_locations, wed, tube_current, gni=None):
+    """
+    Create comprehensive analysis plots
+    """
+    fig, axes = plt.subplots(3 if gni is not None else 2, 1, 
+                            figsize=(12, 12), sharex=True)
+    fig.suptitle('CT Scan Analysis')
+    
+    # Plot WED
+    plot_parameter_vs_location(slice_locations, wed, 
+                             'Water Equivalent Diameter (cm)', 
+                             ax=axes[0], color='blue')
+    
+    # Plot tube current
+    plot_parameter_vs_location(slice_locations, tube_current, 
+                             'Tube Current (mA)', 
+                             ax=axes[1], color='red')
+    
+    
+    #define second y-axis that shares x-axis with current plot
+
+    # Plot GNI if available
+    if gni is not None:
+        plot_parameter_vs_location(slice_locations, gni, 
+                                 'Global Noise Index (HU)', 
+                                 ax=axes[2], color='green')
+    
+    plt.tight_layout()
+    return fig, axes
+
+def plot_wed_tubecurrent_overlay(slice_locations, wed, tube_current):
+    """
+    Create an overlay plot of WED and tube current vs slice location with dual axes
+    """
+    # Set colors
+    col1 = 'steelblue'
+    col2 = 'red'
+    
+    # Create figure and primary axis
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+    
+    # Plot tube current on primary axis
+    ax1.plot(slice_locations, tube_current, color=col1, label='Tube Current')
+    ax1.set_xlabel('Slice Location (mm)', fontsize=14)
+    ax1.set_ylabel('X-Ray Tube Current (mA)', color=col1, fontsize=16)
+    ax1.tick_params(axis='y', labelcolor=col1)
+    
+    # Create secondary axis and plot WED
+    ax2 = ax1.twinx()
+    ax2.plot(slice_locations, wed, color=col2, label='WED')
+    ax2.set_ylabel('Water Equivalent Diameter (cm)', color=col2, fontsize=16)
+    ax2.tick_params(axis='y', labelcolor=col2)
+    
+    # Add legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+    
+    # Add grid (only for primary axis)
+    ax1.grid(True, alpha=0.3)
+    
+    plt.title('Tube Current and Water Equivalent Diameter vs. Slice Location', 
+              fontsize=14, pad=20)
+    
+    plt.tight_layout()
+    return fig, (ax1, ax2)
+
+# def compute_gni(ct_data, kernel_size_mm=6, hu_bins=0.1, pixel_spacing=None):
+#     """
+#     Compute Global Noise Index for each slice following Christianson's method
+#     """
+#     # Convert kernel size from mm to pixels
+#     kernel_size_px = int(round(kernel_size_mm / pixel_spacing[0]))
+#     if kernel_size_px % 2 == 0:
+#         kernel_size_px += 1
+        
+#     gni_values = np.zeros(ct_data.shape[0])
+    
+#     for slice_idx in range(ct_data.shape[0]):
+#         ct_slice = ct_data[slice_idx]
+        
+#         # Segment soft tissue (0-100 HU as per paper)
+#         tissue_mask = (ct_slice >= 0) & (ct_slice <= 100)
+        
+#         # Generate noise map
+#         noise_map = ndimage.generic_filter(
+#             ct_slice,
+#             np.std,
+#             size=kernel_size_px,
+#             mode='constant',
+#             cval=np.nan
+#         )
+        
+#         # Extract noise values from soft tissue regions
+#         tissue_noise = noise_map[tissue_mask]
+#         tissue_noise = tissue_noise[~np.isnan(tissue_noise)]
+        
+#         if len(tissue_noise) > 0:
+#             # Create histogram and find mode
+#             hist, bins = np.histogram(
+#                 tissue_noise,
+#                 bins=np.arange(0, np.nanmax(tissue_noise) + hu_bins, hu_bins)
+#             )
+#             gni_values[slice_idx] = bins[np.argmax(hist)]
+#         else:
+#             gni_values[slice_idx] = np.nan
+            
+#     return gni_values```python
+
+def compute_gni_optimized(ct_data, kernel_size_mm=6, hu_bins=0.1, pixel_spacing=None, body_mask=None, debug_slice=None):
+    """
+    Compute Global Noise Index with proper body and tissue masking
+    Args:
+        ct_data: 3D CT volume in HU
+        kernel_size_mm: kernel size in mm (default 6mm per paper)
+        hu_bins: histogram bin size in HU
+        pixel_spacing: pixel spacing in mm
+        body_mask: binary mask of body region (1 inside body, 0 outside)
+        debug_slice: slice index to show debug visualizations
+    """
+    kernel_size_px = int(round(kernel_size_mm / pixel_spacing[0]))
+    if kernel_size_px % 2 == 0:
+        kernel_size_px += 1
+        
+    gni_values = np.zeros(ct_data.shape[0])
+    kernel = np.ones((kernel_size_px, kernel_size_px))
+    kernel_size = kernel_size_px * kernel_size_px
+    
+    for slice_idx in range(ct_data.shape[0]):
+        ct_slice = ct_data[slice_idx]
+        body_region = body_mask[slice_idx] if body_mask is not None else np.ones_like(ct_slice)
+        
+        # Step 1: Segment soft tissue ONLY within body mask
+        tissue_mask = (ct_slice >= 0) & (ct_slice <= 100) & (body_region > 0)
+        
+        if np.any(tissue_mask):
+            # Step 2: Generate noise map
+            pad_width = kernel_size_px//2
+            slice_pad = np.pad(ct_slice, pad_width, mode='edge')
+            
+            # Calculate standard deviations
+            sum_conv = ndimage.convolve(slice_pad, kernel)
+            sum_sq_conv = ndimage.convolve(slice_pad**2, kernel)
+            
+            # Remove padding
+            sum_conv = sum_conv[pad_width:-pad_width, pad_width:-pad_width]
+            sum_sq_conv = sum_sq_conv[pad_width:-pad_width, pad_width:-pad_width]
+            
+            mean = sum_conv / kernel_size
+            variance = (sum_sq_conv / kernel_size) - mean**2
+            noise_map = np.sqrt(np.maximum(variance, 0))
+            
+            # Only consider noise values within tissue mask
+            noise_values = noise_map[tissue_mask]
+            
+            if len(noise_values) > 0:
+                # Create histogram excluding zeros and outliers
+                valid_noise = noise_values[noise_values > 0]
+                if len(valid_noise) > 0:
+                    max_noise = np.percentile(valid_noise, 99)  # Exclude extreme outliers
+                    hist, bins = np.histogram(
+                        valid_noise,
+                        bins=np.arange(0, max_noise + hu_bins, hu_bins),
+                        density=False
+                    )
+                    peak_idx = np.argmax(hist)
+                    gni_values[slice_idx] = bins[peak_idx]
+                else:
+                    gni_values[slice_idx] = np.nan
+            else:
+                gni_values[slice_idx] = np.nan
+                
+            # Debug visualization
+            if debug_slice is not None and slice_idx == debug_slice:
+                fig, axes = plt.subplots(2, 2, figsize=(15, 15))
+                
+                # Original image
+                im1 = axes[0,0].imshow(ct_slice * body_region, cmap='gray')
+                axes[0,0].set_title('Original CT Slice (Body Region Only)')
+                plt.colorbar(im1, ax=axes[0,0], label='HU')
+                
+                # Tissue mask (white = included tissue)
+                axes[0,1].imshow(tissue_mask, cmap='gray')  # Changed to gray colormap
+                axes[0,1].set_title('Soft Tissue Mask (White = Included)')
+                
+                # Noise map (only showing within tissue mask)
+                masked_noise = np.where(tissue_mask, noise_map, np.nan)
+                im3 = axes[1,0].imshow(masked_noise, cmap='viridis')
+                axes[1,0].set_title('Noise Map (Only in Soft Tissue)')
+                plt.colorbar(im3, ax=axes[1,0], label='HU')
+                
+                # Noise histogram
+                if len(valid_noise) > 0:
+                    axes[1,1].hist(valid_noise, bins='auto', density=False, alpha=0.7)
+                    axes[1,1].axvline(bins[peak_idx], color='r', linestyle='--', 
+                                    label=f'Mode (GNI) = {bins[peak_idx]:.1f}')
+                    axes[1,1].set_title('Noise Histogram in Soft Tissue')
+                    axes[1,1].set_xlabel('Standard Deviation (HU)')
+                    axes[1,1].set_ylabel('Frequency')
+                    axes[1,1].legend()
+                
+                plt.tight_layout()
+                plt.show()
+        else:
+            gni_values[slice_idx] = np.nan
+    
+    return gni_values
+
+def plot_metrics_comparison_optimized(slice_locations, wed, tube_current, gni):
+    """
+    Create efficient plot using precomputed arrays
+    """
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    
+    # Plot all data at once for each axis
+    l1 = ax1.plot(slice_locations, tube_current, 'steelblue', label='Tube Current')[0]
+    ax1_twin = ax1.twinx()
+    l2 = ax1_twin.plot(slice_locations, wed, 'red', label='WED')[0]
+    
+    # Set labels and colors once
+    ax1.set_ylabel('X-Ray Tube Current (mA)', color='steelblue', fontsize=12)
+    ax1_twin.set_ylabel('WED (cm)', color='red', fontsize=12)
+    ax1.tick_params(axis='y', labelcolor='steelblue')
+    ax1_twin.tick_params(axis='y', labelcolor='red')
+    
+    # Add single legend
+    ax1.legend([l1, l2], ['Tube Current', 'WED'], loc='upper right')
+    
+    # Plot GNI
+    ax2.plot(slice_locations, gni, 'green', label='GNI')
+    ax2.set_xlabel('Slice Location (mm)', fontsize=12)
+    ax2.set_ylabel('GNI (HU)', fontsize=12)
+    ax2.legend()
+    
+    # Add grids
+    ax1.grid(True, alpha=0.3)
+    ax2.grid(True, alpha=0.3)
+    
+    plt.suptitle('CT Metrics Comparison', fontsize=14)
+    plt.tight_layout()
+    
+    return fig, (ax1, ax2)
+
+def validate_gni(ct_slice, gni_value):
+    """
+    Validate GNI by comparing to manual ROI measurements in uniform regions
+    """
+    # Place multiple ROIs in uniform soft tissue regions
+    roi_size = 10
+    roi_centers = [
+        (256, 256),  # example center coordinates
+        (256, 276),
+        (256, 236)
+    ]
+    
+    manual_noise = []
+    for center in roi_centers:
+        y, x = center
+        roi = ct_slice[y-roi_size//2:y+roi_size//2, 
+                      x-roi_size//2:x+roi_size//2]
+        if np.all((roi >= 0) & (roi <= 100)):  # Check if ROI is in soft tissue
+            manual_noise.append(np.std(roi))
+    
+    mean_manual_noise = np.mean(manual_noise)
+    print(f"GNI value: {gni_value:.2f}")
+    print(f"Manual ROI noise: {mean_manual_noise:.2f}")
+    return gni_value, mean_manual_noise
+
+def compare_with_reference():
+    """Common noise values from literature"""
+    # From Christianson paper:
+    # Abdomen CT typical noise range: 10-20 HU
+    # From AAPM guidelines:
+    # Head CT typical noise range: 3-7 HU
+    # Body CT typical noise range: 10-18 HU
+    
+    print("Noise distribution in our data:")
+    print(f"Mean GNI: {np.nanmean(gni_values):.2f}")
+    print(f"Range: {np.nanmin(gni_values):.2f} - {np.nanmax(gni_values):.2f}")
+    
+def validate_noise_calculations(ct_data, pixel_spacing, tube_current, wed, gni_values):
+    """
+    Comprehensive validation of noise calculations
+    """
+    # 1. Physical relationship validation
+    mAs_factor = 1/np.sqrt(tube_current)
+    wed_factor = np.exp(wed/2)
+    
+    noise_mAs_corr = np.corrcoef(gni_values[~np.isnan(gni_values)], 
+                                mAs_factor[~np.isnan(gni_values)])[0,1]
+    noise_wed_corr = np.corrcoef(gni_values[~np.isnan(gni_values)], 
+                                wed_factor[~np.isnan(gni_values)])[0,1]
+    
+    print("\nPhysical Relationship Validation:")
+    print(f"Noise vs 1/√(mAs) correlation: {noise_mAs_corr:.3f}")
+    print(f"Noise vs exp(WED/2) correlation: {noise_wed_corr:.3f}")
+    
+    # 2. Check noise range against literature
+    print("\nNoise Range Validation:")
+    compare_with_reference()
+    
+    # 3. Manual ROI validation
+    print("\nManual ROI Validation:")
+    slice_idx = len(ct_data)//2  # middle slice
+    gni, manual = validate_gni(ct_data[slice_idx], gni_values[slice_idx])
+    print(f"Percent difference: {100*abs(gni-manual)/manual:.1f}%")
+
+    # 4. Plot noise distributions
+    plt.figure(figsize=(10,6))
+    plt.hist(gni_values[~np.isnan(gni_values)], bins=50)
+    plt.xlabel('Noise (HU)')
+    plt.ylabel('Frequency')
+    plt.title('Distribution of GNI Values')
+    plt.show()
+    
+def read_ct_volume(ct_dir):
+    """
+    Read CT volume maintaining original DICOM order throughout processing.
+    """
+    dicom_files = glob.glob(os.path.join(ct_dir, '*.dcm'))
+    
+    # Collect instance numbers and locations
+    file_info = []
+    for file in dicom_files:
+        ds = pydicom.dcmread(file)
+        file_info.append({
+            'file': file,
+            'instance_number': int(ds.InstanceNumber),
+            'location': float(ds.SliceLocation)
+        })
+    
+    # Sort files once by instance number
+    file_info.sort(key=lambda x: x['instance_number'])
+    sorted_files = [info['file'] for info in file_info]
+    
+    # Read first file for metadata
+    first_slice = pydicom.dcmread(sorted_files[0])
+    shape = (len(sorted_files), first_slice.Rows, first_slice.Columns)
+    slope = float(first_slice.RescaleSlope)
+    intercept = float(first_slice.RescaleIntercept)
+    pixel_spacing = first_slice.PixelSpacing
+    
+    # Initialize arrays
+    ct_data = np.zeros(shape, dtype=np.float32)
+    tube_current = np.zeros(len(sorted_files))
+    slice_locations = np.zeros(len(sorted_files))
+    
+    # Read data in sorted order
+    for idx, file in enumerate(sorted_files):
+        ds = pydicom.dcmread(file)
+        ct_data[idx] = ds.pixel_array
+        tube_current[idx] = float(ds.XRayTubeCurrent)
+        slice_locations[idx] = float(ds.SliceLocation)
+    
+    # Convert to HU
+    ct_data = ct_data * slope + intercept
+    
+    return ct_data, pixel_spacing, tube_current, slice_locations
+
+
+# def get_dicom_files(case_root: str) -> Tuple[List[str], Optional[str]]:
+#     """
+#     Recursively searches the case_root for DICOM files.
+    
+#     Returns:
+#       - ct_files: List of file paths for CT slices (Modality == "CT")
+#       - rtstruct_file: File path for the RTSTRUCT (Modality == "RTSTRUCT"), if found.
+#     """
+#     ct_files = []
+#     rtstruct_file = None
+#     for root, _, files in os.walk(case_root):
+#         for file in files:
+#             if not file.lower().endswith('.dcm'):
+#                 continue
+#             file_path = os.path.join(root, file)
+#             try:
+#                 ds = pydicom.dcmread(file_path, stop_before_pixels=True)
+#             except (InvalidDicomError, Exception) as e:
+#                 logging.warning(f"Error reading file {file_path}: {e}")
+#                 continue
+#             modality = ds.get("Modality", "").upper()
+#             if modality == "CT":
+#                 ct_files.append(file_path)
+#             elif modality == "RTSTRUCT":
+#                 rtstruct_file = file_path
+#     if not ct_files:
+#         raise ValueError(f"No CT files found in {case_root}")
+#     if rtstruct_file is None:
+#         logging.warning(f"No RTSTRUCT file found in {case_root}. Using fallback threshold segmentation for body mask.")
+#     return ct_files, rtstruct_file
+
+# =============================================================================
+# Main Processing Function
+# =============================================================================
+
+def parse_rtstruct(rtstruct_file: str, ct_dir: str) -> Dict[str, np.ndarray]:
+    """
+    Parses the RTSTRUCT file using the rt_utils package.
+    
+    Returns:
+      A dictionary mapping ROI names to 3D binary masks (shape: [num_slices, height, width]).
+    """
+    try:
+        from rt_utils import RTStructBuilder  # Ensure rt_utils is installed.
+        rtstruct = RTStructBuilder.create_from(dicom_series_path=ct_dir, rt_struct_path=rtstruct_file)
+    except Exception as e:
+        raise RuntimeError(f"Error reading RTSTRUCT file: {e}")
+    
+    roi_names = rtstruct.get_roi_names()
+    logging.info(f"Available ROI names: {roi_names}")
+    masks = {}
+    for roi in roi_names:
+        try:
+            mask = rtstruct.get_roi_mask_by_name(roi).astype(bool)
+            # Only attempt transposition if the expected attribute is present.
+            if mask.ndim == 3:
+                if hasattr(rtstruct, 'dicom_series'):
+                    if mask.shape[0] != rtstruct.dicom_series.shape[0]:
+                        mask = np.transpose(mask, (2, 0, 1))
+                else:
+                    # If dicom_series attribute is not present, skip transposition.
+                    logging.warning(f"Attribute 'dicom_series' not found in RTSTRUCT for ROI '{roi}'.")
+            masks[roi] = mask
+        except Exception as e:
+            logging.warning(f"Error processing ROI {roi}: {e}")
+            continue
+    return masks
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+def read_ct_volume(ct_dir):
+    """
+    Read CT volume maintaining original DICOM order throughout processing.
+    """
+    dicom_files = glob.glob(os.path.join(ct_dir, '*.dcm'))
+    
+    # First pass: collect instance numbers and locations
+    file_info = []
+    for file in dicom_files:
+        ds = pydicom.dcmread(file)
+        file_info.append({
+            'file': file,
+            'instance_number': int(ds.InstanceNumber),
+            'location': float(ds.SliceLocation)
+        })
+    
+    # Sort files once by instance number
+    file_info.sort(key=lambda x: x['instance_number'])
+    sorted_files = [info['file'] for info in file_info]
+    
+    # Read first file for metadata
+    first_slice = pydicom.dcmread(sorted_files[0])
+    shape = (len(sorted_files), first_slice.Rows, first_slice.Columns)
+    slope = float(first_slice.RescaleSlope)
+    intercept = float(first_slice.RescaleIntercept)
+    pixel_spacing = first_slice.PixelSpacing
+    
+    # Initialize arrays
+    ct_data = np.zeros(shape, dtype=np.float32)
+    tube_current = np.zeros(len(sorted_files))
+    slice_locations = np.zeros(len(sorted_files))
+    
+    # Read data in sorted order
+    for idx, file in enumerate(sorted_files):
+        ds = pydicom.dcmread(file)
+        ct_data[idx] = ds.pixel_array
+        tube_current[idx] = float(ds.XRayTubeCurrent)
+        slice_locations[idx] = float(ds.SliceLocation)
+    
+    # Convert to HU
+    ct_data = ct_data * slope + intercept
+    
+    return ct_data, pixel_spacing, tube_current, slice_locations
+
+
+def get_dicom_files(case_root: str) -> Tuple[List[str], Optional[str]]:
+    """
+    Recursively searches the case_root for DICOM files.
+    
+    Returns:
+      - ct_files: List of file paths for CT slices (Modality == "CT")
+      - rtstruct_file: File path for the RTSTRUCT (Modality == "RTSTRUCT"), if found.
+    """
+    ct_files = []
+    rtstruct_file = None
+    for root, _, files in os.walk(case_root):
+        for file in files:
+            if not file.lower().endswith('.dcm'):
+                continue
+            file_path = os.path.join(root, file)
+            try:
+                ds = pydicom.dcmread(file_path, stop_before_pixels=True)
+            except (InvalidDicomError, Exception) as e:
+                logging.warning(f"Error reading file {file_path}: {e}")
+                continue
+            modality = ds.get("Modality", "").upper()
+            if modality == "CT":
+                ct_files.append(file_path)
+            elif modality == "RTSTRUCT":
+                rtstruct_file = file_path
+    if not ct_files:
+        raise ValueError(f"No CT files found in {case_root}")
+    if rtstruct_file is None:
+        logging.warning(f"No RTSTRUCT file found in {case_root}. Using fallback threshold segmentation for body mask.")
+    return ct_files, rtstruct_file
+
+
+def create_body_mask(contour):
+    """
+    Generate a body mask from RTSTRUCT contours.
+    """
+    mask = np.zeros_like(contour)
+    for i in range(contour.shape[0]):
+        for x in range(contour.shape[2]):
+            contour_col = contour[i, :, x]
+            contour_points = np.where(contour_col > 0)[0]
+            if len(contour_points) > 0:
+                min_y = np.min(contour_points)
+                max_y = np.max(contour_points)
+                mask[i, min_y:max_y, x] = 1
+    return mask
+
+def compute_tian_noise2(ct_data: np.ndarray, body_mask: np.ndarray = None, 
+                      roi_size: int = 30, edge_threshold: float = 100) -> np.ndarray:
+    """
+    Compute noise using Tian's subtraction method with proper tissue segmentation.
+    
+    Implementation follows: 
+    Tian X, Samei E. Accurate assessment and prediction of noise in clinical CT images. 
+    Med Phys. 2016;43(1):475-482.
+    
+    Method steps:
+    1. Sequential slice subtraction to remove anatomical correlations
+    2. Edge detection to identify remaining structural transitions
+    3. ROI-based noise analysis in homogeneous regions
+    
+    Args:
+        ct_data: 3D CT volume in HU [slices, rows, cols]
+        body_mask: Binary mask of body region (1 inside, 0 outside)
+        roi_size: Size of ROI patches for noise analysis (default 30 per paper)
+        edge_threshold: Gradient magnitude threshold for edge detection
+        
+    Returns:
+        noise_values: Array of noise measurements per slice
+        
+    Note:
+        - Body mask is used to constrain analysis to patient tissue
+        - Edge detection threshold based on gradient magnitude in HU
+        - Noise computed as SD/√2 due to subtraction of independent noise
+    """
+    num_slices = ct_data.shape[0]
+    noise_values = np.zeros(num_slices)
+    
+    # Process each slice except last one
+    for i in range(num_slices - 1):
+        try:
+            # 1. Sequential slice subtraction
+            diff_image = ct_data[i] - ct_data[i + 1]
+            
+            # Apply body mask to difference image
+            if body_mask is not None:
+                # Use intersection of masks from both slices
+                combined_mask = body_mask[i] & body_mask[i + 1]
+                diff_image = np.where(combined_mask, diff_image, np.nan)
+            
+            # 2. Edge detection on difference image
+            sobelx = cv2.Sobel(diff_image, cv2.CV_64F, 1, 0, ksize=3)
+            sobely = cv2.Sobel(diff_image, cv2.CV_64F, 0, 1, ksize=3)
+            gradient_mag = np.sqrt(sobelx**2 + sobely**2)
+            
+            # Create edge mask
+            edge_mask = gradient_mag < edge_threshold
+            
+            # 3. ROI-based noise analysis
+            valid_noise_values = []
+            
+            # Step through image with 50% overlap between ROIs
+            step_size = roi_size // 2
+            for y in range(0, diff_image.shape[0] - roi_size, step_size):
+                for x in range(0, diff_image.shape[1] - roi_size, step_size):
+                    # Extract ROI
+                    roi = diff_image[y:y + roi_size, x:x + roi_size]
+                    roi_edge_mask = edge_mask[y:y + roi_size, x:x + roi_size]
+                    
+                    if body_mask is not None:
+                        roi_body_mask = combined_mask[y:y + roi_size, x:x + roi_size]
+                        # Skip if ROI not fully within body
+                        if not np.all(roi_body_mask):
+                            continue
+                    
+                    # Skip if ROI contains edges
+                    if not np.all(roi_edge_mask):
+                        continue
+                        
+                    # Skip if ROI contains invalid values
+                    if np.any(np.isnan(roi)):
+                        continue
+                    
+                    # Calculate noise
+                    noise = np.std(roi) / np.sqrt(2)  # Divide by √2 due to subtraction
+                    valid_noise_values.append(noise)
+            
+            if valid_noise_values:
+                # Use median for robustness to outliers
+                noise_values[i] = np.median(valid_noise_values)
+            else:
+                noise_values[i] = np.nan
+                logging.info(f"No valid noise measurements found for slice {i}")
+                
+        except Exception as e:
+            logging.error(f"Error processing slice {i}: {str(e)}")
+            noise_values[i] = np.nan
+            
+    # Handle last slice using last valid measurement
+    valid_indices = np.where(~np.isnan(noise_values))[0]
+    if len(valid_indices) > 0:
+        noise_values[-1] = noise_values[valid_indices[-1]]
+    else:
+        noise_values[-1] = np.nan
+    
+    return noise_values
+
+def validate_noise_methods2(ct_data: np.ndarray, gni_values: np.ndarray, 
+                         tian_values: np.ndarray, slice_idx: Optional[int] = None) -> None:
+    """
+    Compare and validate both noise measurement methods.
+    
+    Args:
+        ct_data: Original CT volume
+        gni_values: GNI measurements
+        tian_values: Tian noise measurements
+        slice_idx: Optional specific slice to analyze
+    """
+    if slice_idx is None:
+        slice_idx = ct_data.shape[0] // 2  # Use middle slice
+        
+    # Compare measurements
+    print(f"\nNoise Comparison for Slice {slice_idx}:")
+    print(f"GNI Value: {gni_values[slice_idx]:.2f} HU")
+    print(f"Tian Value: {tian_values[slice_idx]:.2f} HU")
+    
+    # Calculate % difference
+    if not np.isnan(gni_values[slice_idx]) and not np.isnan(tian_values[slice_idx]):
+        pct_diff = 100 * abs(gni_values[slice_idx] - tian_values[slice_idx]) / gni_values[slice_idx]
+        print(f"Percent Difference: {pct_diff:.1f}%")
+    
+    # Literature comparison
+    print("\nTypical Ranges from Literature:")
+    print("Head CT: 3-7 HU")
+    print("Body CT: 10-18 HU")
+    
+    # Optional: Generate validation plots
+    if COMPUTE_CONFIG['VALIDATE_SUBSET']:
+        validate_tian_noise(ct_data, tian_values, slice_idx)
+
+def get_optimal_bin_width(data):
+    """
+    Calculate optimal bin width using Freedman-Diaconis rule.
+    Optimal bin width = 2 * IQR * n^(-1/3)
+    where IQR is interquartile range and n is number of observations
+    """
+    q75, q25 = np.percentile(data, [75, 25])
+    iqr = q75 - q25
+    n = len(data)
+    width = 2 * iqr * (n ** (-1/3))
+    return max(width, 0.1)  # Minimum 0.1 HU bin width for precision
+
+def plot_noise_profile(ct_data: np.ndarray, noise_values: np.ndarray, 
+                      slice_locations: np.ndarray = None):
+    """
+    Plot noise profile overlaid on coronal reconstruction.
+    Similar to visualization in Christianson et al. Fig 3.
+    """
+    # Get central coronal slice
+    mid_idx = ct_data.shape[1] // 2
+    coronal_slice = ct_data[:, mid_idx, :]
+    
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+    
+    # Plot coronal image
+    im = ax1.imshow(coronal_slice.T, cmap='gray', aspect='auto')
+    ax1.set_xlabel('Slice Number')
+    ax1.set_ylabel('Position (pixels)')
+    
+    # Create second y-axis for noise values
+    ax2 = ax1.twinx()
+    if slice_locations is not None:
+        ax2.plot(noise_values, slice_locations, 'r-', linewidth=2)
+        ax2.set_ylabel('Slice Location (mm)', color='r')
+    else:
+        ax2.plot(noise_values, 'r-', linewidth=2)
+        ax2.set_ylabel('Noise (HU)', color='r')
+    
+    plt.title('Noise Profile vs. Anatomical Position')
+    plt.tight_layout()
+    return fig, (ax1, ax2)
+
+def compute_regional_noise(ct_data: np.ndarray, noise_values: np.ndarray, 
+                         method: str = 'landmarks', 
+                         organ_masks: dict = None):
+    """
+    Compute regional noise values using either anatomical landmarks or organ masks.
+    
+    As described in Özsoykal et al. "Size-specific dose estimates in chest, abdomen,
+    and pelvis CT examinations of pediatric patients":
+    "Anatomic markers used to separate each region were determined as top and bottom 
+    of the lungs, top of the liver and pelvic crest, top of the pelvic crest and 
+    pubic symphysis, respectively, for chest, abdomen, and pelvis"
+    
+    Args:
+        ct_data: CT volume
+        noise_values: Per-slice noise measurements
+        method: Either 'landmarks' or 'masks'
+        organ_masks: Dict of organ masks if using mask method
+    """
+    if method == 'landmarks':
+        # Find anatomical landmarks
+        # This would need manual input or automated detection
+        regions = {
+            'chest': slice(None, None),  # Replace with actual slice ranges
+            'abdomen': slice(None, None),
+            'pelvis': slice(None, None)
+        }
+        
+    elif method == 'masks':
+        if organ_masks is None:
+            raise ValueError("Organ masks required for mask-based method")
+        regions = {}
+        for organ, mask in organ_masks.items():
+            # Find slices where organ is present
+            organ_slices = np.any(mask, axis=(1,2))
+            regions[organ] = slice(np.where(organ_slices)[0][0],
+                                 np.where(organ_slices)[0][-1])
+    
+    # Compute regional statistics
+    regional_stats = {}
+    for region, slices in regions.items():
+        region_noise = noise_values[slices]
+        regional_stats[region] = {
+            'mean': np.nanmean(region_noise),
+            'std': np.nanstd(region_noise),
+            'median': np.nanmedian(region_noise),
+            'n_slices': np.sum(~np.isnan(region_noise))
+        }
+    
+    return regional_stats
+   
+def compute_tian_noise(ct_data: np.ndarray, body_mask: np.ndarray = None, 
+                      roi_size: int = 30) -> np.ndarray:
+    """
+    Compute noise using Tian's subtraction method.
+    Implementation follows: Tian X, Samei E. Accurate assessment and prediction of 
+    noise in clinical CT images. Med Phys. 2016;43(1):475-482.
+    
+    Steps:
+    1. Subtract sequential slices to remove anatomical structures
+    2. Calculate gradient threshold as 2 × mean gradient magnitude
+    3. Identify regions without strong edges
+    4. Measure noise in homogeneous regions using non-overlapping ROIs
+    5. Scale by 1/√2 to account for subtraction
+    
+    Args:
+        ct_data: 3D CT volume in HU [slices, rows, cols]
+        body_mask: Binary mask of body region (1 inside, 0 outside)
+        roi_size: Size of ROI patches for noise analysis
+        
+    Returns:
+        noise_values: Array of noise measurements per slice
+    """
+    num_slices = ct_data.shape[0]
+    noise_values = np.zeros(num_slices)
+    
+    for i in range(num_slices - 1):
+        try:
+            # 1. Sequential slice subtraction
+            diff_image = ct_data[i] - ct_data[i + 1]
+            
+            # Apply body mask if provided
+            if body_mask is not None:
+                combined_mask = body_mask[i] & body_mask[i + 1]
+                diff_image = np.where(combined_mask, diff_image, np.nan)
+            
+            # 2. Calculate gradient threshold
+            dx = cv2.Sobel(diff_image, cv2.CV_64F, 1, 0, ksize=3)
+            dy = cv2.Sobel(diff_image, cv2.CV_64F, 0, 1, ksize=3)
+            gradient_mag = np.sqrt(dx**2 + dy**2)
+            grad_threshold = 2 * np.nanmean(gradient_mag)
+            
+            # 3. Create edge mask
+            edge_mask = gradient_mag > grad_threshold
+            
+            # 4. ROI-based noise analysis
+            valid_noise_values = []
+            
+            # Use non-overlapping ROIs
+            for y in range(0, diff_image.shape[0] - roi_size + 1, roi_size):
+                for x in range(0, diff_image.shape[1] - roi_size + 1, roi_size):
+                    roi = diff_image[y:y + roi_size, x:x + roi_size]
+                    roi_edge_mask = edge_mask[y:y + roi_size, x:x + roi_size]
+                    imtool3d(roi)
+                    # Skip if ROI contains edges or NaN values
+                    if np.any(roi_edge_mask) or np.any(np.isnan(roi)):
+                        continue
+                    
+                    # 5. Calculate noise (SD/√2 due to subtraction)
+                    noise = np.std(roi) / np.sqrt(2)
+                    valid_noise_values.append(noise)
+            
+            if valid_noise_values:
+                    # Calculate mode of noise values using histogram
+                # Use appropriate bin size for continuous data
+                hist, bins = np.histogram(valid_noise_values, bins=50)  # Adjust bin number as needed
+                mode_idx = np.argmax(hist)
+                noise_values[i] = bins[mode_idx]  # Use bin center where count is highest
+            else:
+                noise_values[i] = np.nan
+                
+        except Exception as e:
+            logging.error(f"Error processing slice {i}: {str(e)}")
+            noise_values[i] = np.nan
+    
+    # Handle last slice
+    noise_values[-1] = noise_values[-2] if not np.isnan(noise_values[-2]) else np.nan
+    
+    return noise_values
+
+def validate_tian_noise(ct_data: np.ndarray, noise_values: np.ndarray, 
+                       slice_idx: int = None) -> None:
+    """
+    Validate Tian noise measurements.
+    
+    Args:
+        ct_data: Original CT volume
+        noise_values: Computed noise values
+        slice_idx: Optional slice index for visualization
+    """
+    if slice_idx is None:
+        slice_idx = ct_data.shape[0] // 2
+        
+    # Create validation visualization
+    fig, axes = plt.subplots(2, 2, figsize=(15, 15))
+    
+    # Original slices
+    axes[0,0].imshow(ct_data[slice_idx], cmap='gray')
+    axes[0,0].set_title('Original Slice')
+    
+    # Difference image
+    diff_image = ct_data[slice_idx] - ct_data[slice_idx + 1]
+    im2 = axes[0,1].imshow(diff_image, cmap='gray')
+    axes[0,1].set_title('Difference Image')
+    plt.colorbar(im2, ax=axes[0,1])
+    
+    # Edge detection
+    dx = cv2.Sobel(diff_image, cv2.CV_64F, 1, 0, ksize=3)
+    dy = cv2.Sobel(diff_image, cv2.CV_64F, 0, 1, ksize=3)
+    gradient_mag = np.sqrt(dx**2 + dy**2)
+    grad_threshold = 2 * np.nanmean(gradient_mag)
+    edge_mask = gradient_mag > grad_threshold
+    
+    axes[1,0].imshow(edge_mask, cmap='gray')
+    axes[1,0].set_title('Edge Detection')
+    
+    # Noise values plot
+    valid_slices = ~np.isnan(noise_values)
+    axes[1,1].plot(range(len(noise_values))[valid_slices], 
+                  noise_values[valid_slices], 'b-')
+    axes[1,1].set_xlabel('Slice Number')
+    axes[1,1].set_ylabel('Noise (HU)')
+    axes[1,1].set_title('Noise Values')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Print summary statistics
+    print(f"\nNoise Statistics:")
+    print(f"Mean noise: {np.nanmean(noise_values):.2f} HU")
+    print(f"Std deviation: {np.nanstd(noise_values):.2f} HU")
+    print(f"Range: {np.nanmin(noise_values):.2f} - {np.nanmax(noise_values):.2f} HU")
+# Modify process_case function
+def process_case(case_root: str, case_number: int = None):
+    """
+    Processes a single patient case with configurable metrics computation.
+    """
+    logging.info(f"Processing case in: {case_root}")
+    
+    primary_folder = os.path.basename(os.path.dirname(case_root))  
+    second_folder = os.path.basename(case_root)
+
+    ct_data, pixel_spacing, tube_current, slice_locations = read_ct_volume(case_root)
+    
+    # Only get RTSTRUCT if needed for GNI or WED
+    mask = None
+    if COMPUTE_CONFIG['GNI'] or COMPUTE_CONFIG['WED']:
+        _, rtstruct_file = get_dicom_files(os.path.dirname(case_root))
+        if not rtstruct_file:
+            logging.warning(f"Skipping case {case_root} due to missing RTSTRUCT.")
+            return None
+            
+        rtstruct = RTStructBuilder.create_from(dicom_series_path=case_root, rt_struct_path=rtstruct_file)
+        contour = rtstruct.get_roi_mask_by_name("Skin").astype(np.float32).transpose(2,0,1).copy()
+        contour = np.flip(contour, axis=0)
+        mask = create_body_mask(contour)
+
+    # Initialize results
+    results = {}
+    slice_indices = list(range(len(slice_locations)))
+    
+    # Compute only requested metrics
+    if COMPUTE_CONFIG['WED']:
+        pixel_width, pixel_height = pixel_spacing[0], pixel_spacing[1]
+        wed = compute_wed(ct_data, mask, pixel_width, pixel_height)
+        results['WED'] = wed
+        
+    if COMPUTE_CONFIG['GNI']:
+        gni = compute_gni_optimized(ct_data, kernel_size_mm=6, hu_bins=0.1, 
+                                  pixel_spacing=pixel_spacing, body_mask=mask)
+        results['GNI'] = gni
+        
+    if COMPUTE_CONFIG['TIAN']:
+        tian_noise = compute_tian_noise(ct_data, body_mask=mask)
+        results['Tian_Noise'] = tian_noise
+        
+        # Optional validation
+        if COMPUTE_CONFIG['VALIDATE_SUBSET'] and case_number is not None:
+            if case_number % COMPUTE_CONFIG['VALIDATION_INTERVAL'] == 0:
+                logging.info(f"Validating case {case_number}")
+                validate_tian_noise(ct_data, tian_noise)
+
+    # Save to Excel - only save computed metrics
+    output_filename = f"{primary_folder}_{second_folder}_metrics.xlsx"
+    with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
+        for metric_name, metric_values in results.items():
+            pd.DataFrame([metric_values], 
+                        index=[f"{primary_folder}/{second_folder}"], 
+                        columns=slice_indices).to_excel(writer, sheet_name=metric_name)
+        
+        # Always save tube current as it's available from DICOM
+        pd.DataFrame([tube_current], 
+                    index=[f"{primary_folder}/{second_folder}"], 
+                    columns=slice_indices).to_excel(writer, sheet_name="Tube Current")
+
+    logging.info(f"Results saved to {output_filename}")
+    return output_filename
+
+# import os
+# import pandas as pd
+# import numpy as np
+# import logging
+# from typing import List, Dict
+# from openpyxl import Workbook
+
+# def process_case(case_root: str):
+#     """
+#     Processes a single patient case and saves GNI, WED, and Tube Current per slice into an Excel file.
+#     """
+#     logging.info(f"Processing case in: {case_root}")
+    
+#     # Extract folder names for the output file
+#     primary_folder = os.path.basename(os.path.dirname(case_root))  # e.g., Pediatric-CT-SEG-0B387FB5
+#     second_folder = os.path.basename(case_root)  # e.g., 09-02-2004-NA-CT-86719
+
+#     # Read CT volume
+#     ct_data, pixel_spacing, tube_current, slice_locations = read_ct_volume(case_root)
+    
+#     # Get RTSTRUCT file
+#     _, rtstruct_file = get_dicom_files(os.path.dirname(case_root))
+
+#     # Parse RTSTRUCT to obtain skin ROI
+#     rtstruct = RTStructBuilder.create_from(dicom_series_path=case_root, rt_struct_path=rtstruct_file)
+#     contour = rtstruct.get_roi_mask_by_name("Skin").astype(np.float32).transpose(2,0,1).copy()
+#     contour = np.flip(contour, axis=0)
+#     mask = create_body_mask(contour)
+
+#     # Compute WED
+#     pixel_width, pixel_height = pixel_spacing[0], pixel_spacing[1]
+#     wed = compute_wed(ct_data, mask, pixel_width, pixel_height)
+
+#     # Compute GNI
+#     gni = compute_gni_optimized(ct_data, kernel_size_mm=6, hu_bins=0.1, pixel_spacing=pixel_spacing)
+
+#     # Store results in dictionary format for Excel output
+#     slice_indices = list(range(len(slice_locations)))  # Slice indices
+#     gni_values = gni  # Per slice GNI
+#     wed_values = wed  # Per slice WED
+#     tube_current_values = tube_current  # Per slice tube current
+
+#     # Convert results to DataFrame format for Excel output
+#     gni_df = pd.DataFrame([gni_values], index=[f"{primary_folder}/{second_folder}"], columns=slice_indices)
+#     wed_df = pd.DataFrame([wed_values], index=[f"{primary_folder}/{second_folder}"], columns=slice_indices)
+#     tube_current_df = pd.DataFrame([tube_current_values], index=[f"{primary_folder}/{second_folder}"], columns=slice_indices)
+
+#     # Create Excel Writer with multiple sheets
+#     output_filename = f"{primary_folder}_{second_folder}_metrics.xlsx"
+#     with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
+#         gni_df.to_excel(writer, sheet_name="GNI")
+#         wed_df.to_excel(writer, sheet_name="WED")
+#         tube_current_df.to_excel(writer, sheet_name="Tube Current")
+
+#     logging.info(f"Results saved to {output_filename}")
+
+#     return output_filename
+
+
+# =============================================================================
+# Main Function
+# =============================================================================
+
+# Modify main function to include case numbering
+def main():
+    master_dir = "/media/nvme/Python/PediatricCTDataset/manifest-1647979711903/Pediatric-CT-SEG/"
+    
+    # Initialize result storage based on config
+    all_results = {
+        'Tube Current': []  # Always include tube current
+    }
+    # Add enabled metrics
+    if COMPUTE_CONFIG['GNI']:
+        all_results['GNI'] = []
+    if COMPUTE_CONFIG['TIAN']:
+        all_results['Tian_Noise'] = []
+    if COMPUTE_CONFIG['WED']:
+        all_results['WED'] = []
+    
+    dicom_dirs = set()
+    for root, _, files in os.walk(master_dir):
+        if any(f.lower().endswith('.dcm') for f in files):
+            if "CT" in os.path.basename(root) and "RTSTRUCT" not in os.path.basename(root):
+                dicom_dirs.add(root)
+
+    dicom_dirs = sorted(list(dicom_dirs))
+
+    for case_num, case_root in enumerate(dicom_dirs, 1):
+        print(f"Processing: {case_root}")
+        try:
+            # Get folder names for index
+            primary_folder = os.path.basename(os.path.dirname(case_root))
+            second_folder = os.path.basename(case_root)
+            index_name = f"{primary_folder}/{second_folder}"
+            
+            # Process the case
+            ct_data, pixel_spacing, tube_current, slice_locations = read_ct_volume(case_root)
+            
+            # Only get RTSTRUCT if needed for GNI or WED
+            mask = None
+            if COMPUTE_CONFIG['GNI'] or COMPUTE_CONFIG['WED']:
+                _, rtstruct_file = get_dicom_files(os.path.dirname(case_root))
+                if not rtstruct_file:
+                    logging.warning(f"Skipping case {case_root} due to missing RTSTRUCT.")
+                    continue
+
+                rtstruct = RTStructBuilder.create_from(dicom_series_path=case_root, rt_struct_path=rtstruct_file)
+                contour = rtstruct.get_roi_mask_by_name("Skin").astype(np.float32).transpose(2,0,1).copy()
+                contour = np.flip(contour, axis=0)
+                mask = create_body_mask(contour)
+            
+            # Create series for each enabled metric
+            slice_indices = list(range(len(slice_locations)))
+            
+            # Compute metrics based on configuration
+            if COMPUTE_CONFIG['WED']:
+                wed = compute_wed(ct_data, mask, pixel_spacing[0], pixel_spacing[1])
+                wed_series = pd.DataFrame([wed], index=[index_name], columns=slice_indices)
+                all_results['WED'].append(wed_series)
+            
+            if COMPUTE_CONFIG['GNI']:
+                gni = compute_gni_optimized(ct_data, kernel_size_mm=6, hu_bins=0.1, 
+                                          pixel_spacing=pixel_spacing, body_mask=mask)
+                gni_series = pd.DataFrame([gni], index=[index_name], columns=slice_indices)
+                all_results['GNI'].append(gni_series)
+            
+            if COMPUTE_CONFIG['TIAN']:
+                tian_noise = compute_tian_noise(ct_data, body_mask=mask)
+                tian_series = pd.DataFrame([tian_noise], index=[index_name], columns=slice_indices)
+                all_results['Tian_Noise'].append(tian_series)
+                
+                # Optional validation
+                if COMPUTE_CONFIG['VALIDATE_SUBSET'] and case_num % COMPUTE_CONFIG['VALIDATION_INTERVAL'] == 0:
+                    validate_tian_noise(ct_data, tian_noise)
+            
+            # Always store tube current
+            tube_current_series = pd.DataFrame([tube_current], index=[index_name], columns=slice_indices)
+            all_results['Tube Current'].append(tube_current_series)
+            
+        except Exception as e:
+            logging.warning(f"Error processing case {case_root}: {e}")
+            continue
+
+    # Save final results
+    output_filename = 'all_metrics.xlsx'
+    with pd.ExcelWriter(output_filename) as writer:
+        for metric_name, results_list in all_results.items():
+            if results_list:  # Only save if we have results
+                combined_metric = pd.concat(results_list)
+                combined_metric.to_excel(writer, sheet_name=metric_name)
+    
+    print(f"All results saved to {output_filename}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+{
+    "right adrenal gland": "mask_Adrenal-Right.nii.gz",
+    "left adrenal gland": "mask_Adrenal-Left.nii.gz",
+    "bladder": "mask_Bladder.nii.gz",
+    "duodenum": "mask_Duodenum.nii.gz",
+    "esophagus": "mask_Esophagus.nii.gz",
+    "gallbladder": "mask_Gall-Bladder.nii.gz",
+    "heart": "mask_Heart.nii.gz",
+    "right kidney": "mask_Kidney-Right.nii.gz",
+    "left kidney": "mask_Kidney-Left.nii.gz",
+    "liver": "mask_Liver.nii.gz",
+    "pancreas": "mask_Pancreas.nii.gz",
+    "prostate": "mask_Prostate.nii.gz",
+    "small bowel": "mask_Small-Intestine.nii.gz",
+    "spleen": "mask_Spleen.nii.gz",
+    "stomach": "mask_Stomach.nii.gz"
+}

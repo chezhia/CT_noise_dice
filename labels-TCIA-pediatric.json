@@ -1,0 +1,17 @@
+{
+    "right adrenal gland": 8,
+    "left adrenal gland": 9,
+    "bladder": 15,
+    "duodenum": 13,
+    "esophagus": 11,
+    "gallbladder": 10,
+    "heart": 115,
+    "right kidney": 5,
+    "left kidney": 14,
+    "liver": 1,
+    "pancreas": 4,
+    "prostate": 118,
+    "small bowel": 19,
+    "spleen": 3,
+    "stomach": 12
+}
